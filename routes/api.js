@@ -4,7 +4,7 @@ const dns = require('dns');
 
 const router = express.Router();
 
-// Get Ip
+// Get Ip Address
 router.get('/get-ip/',(req, res) => {
     const {url} = req.query; 
     try {
