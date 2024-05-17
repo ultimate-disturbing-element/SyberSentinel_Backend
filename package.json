@@ -1,0 +1,29 @@
+{
+  "name": "sybersentinel_backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ultimate-disturbing-element/SyberSentinel_Backend.git"
+  },
+  "author": "Abhinav Rai",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/ultimate-disturbing-element/SyberSentinel_Backend/issues"
+  },
+  "homepage": "https://github.com/ultimate-disturbing-element/SyberSentinel_Backend#readme",
+  "dependencies": {
+    "connect-history-api-fallback": "^2.0.0",
+    "cors": "^2.8.5",
+    "dns": "^0.2.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.2.0",
+    "fs": "0.0.1-security",
+    "path": "^0.12.7"
+  }
+}
