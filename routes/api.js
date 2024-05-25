@@ -6,6 +6,8 @@ const dns = require("dns");
 const tls = require("tls");
 const util = require('util');
 const cheerio = require('cheerio');
+const puppeteer = require('puppeteer');
+const https = require('https');
 
 const router = express.Router();
 
@@ -220,6 +222,110 @@ router.get('/header',async (req,res)=>{
         throw new Error(error.message);
       }
 })
+
+// Cookies
+router.get('/cookies', async (req, res) => {
+  const {url} = req.query;
+  if (!url) {
+    return res.status(400).send({ error: 'URL parameter is required' });
+  }
+
+  const getPuppeteerCookies = async (url) => {
+    const browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+
+    try {
+      const page = await browser.newPage();
+      const navigationPromise = page.goto(url, { waitUntil: 'networkidle2' });
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Puppeteer took too long!')), 3000)
+      );
+      await Promise.race([navigationPromise, timeoutPromise]);
+      return await page.cookies();
+    } finally {
+      await browser.close();
+    }
+  };
+
+  let headerCookies = null;
+  let clientCookies = null;
+
+  try {
+    const response = await axios.get(url, {
+      withCredentials: true,
+      maxRedirects: 5,
+    });
+    headerCookies = response.headers['set-cookie'];
+  } catch (error) {
+    if (error.response) {
+      return res.status(500).send({ error: `Request failed with status ${error.response.status}: ${error.message}` });
+    } else if (error.request) {
+      return res.status(500).send({ error: `No response received: ${error.message}` });
+    } else {
+      return res.status(500).send({ error: `Error setting up request: ${error.message}` });
+    }
+  }
+
+  try {
+    clientCookies = await getPuppeteerCookies(url);
+  } catch (_) {
+    clientCookies = null;
+  }
+
+  if (!headerCookies && (!clientCookies || clientCookies.length === 0)) {
+    return res.status(200).send({ skipped: 'No cookies' });
+  }
+
+  res.status(200).send({ headerCookies, clientCookies });
+});
+
+// hsts
+router.get('/hsts', async (req, res) => {
+  const { url } = req.query;
+
+  const errorResponse = (message, statusCode = 500) => {
+    return res.status(statusCode).json({ error: message });
+  };
+
+  const hstsIncompatible = (message, compatible = false, hstsHeader = null) => {
+    return res.json({ message, compatible, hstsHeader });
+  };
+
+  try {
+    const req = https.request(url, response => {
+      const headers = response.headers;
+      const hstsHeader = headers['strict-transport-security'];
+
+      if (!hstsHeader) {
+        return hstsIncompatible(`Site does not serve any HSTS headers.`);
+      } else {
+        const maxAgeMatch = hstsHeader.match(/max-age=(\d+)/);
+        const includesSubDomains = hstsHeader.includes('includeSubDomains');
+        const preload = hstsHeader.includes('preload');
+
+        if (!maxAgeMatch || parseInt(maxAgeMatch[1]) < 10886400) {
+          return hstsIncompatible(`HSTS max-age is less than 10886400.`);
+        } else if (!includesSubDomains) {
+          return hstsIncompatible(`HSTS header does not include all subdomains.`);
+        } else if (!preload) {
+          return hstsIncompatible(`HSTS header does not contain the preload directive.`);
+        } else {
+          return hstsIncompatible(`Site is compatible with the HSTS preload list!`, true, hstsHeader);
+        }
+      }
+    });
+
+    req.on('error', error => {
+      return errorResponse(`Error making request: ${error.message}`);
+    });
+
+    req.end();
+  } catch (error) {
+    return errorResponse(`Error: ${error.message}`);
+  }
+});
 
 // threats
 router.get('/threats',async (req,res)=>{})
