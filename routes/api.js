@@ -9,6 +9,7 @@ const cheerio = require('cheerio');
 const puppeteer = require('puppeteer');
 const https = require('https');
 const urlLib = require('url');
+const traceroute = require('traceroute');
 
 const router = express.Router();
 
@@ -496,6 +497,249 @@ router.get('/block-list', async (req, res) => {
   }
 });
 
+// tls
+router.get('/tls', async (req, res) => {
+  const TLS_OBSERVATORY_MOZILLA_API = 'https://tls-observatory.services.mozilla.com/api/v1';
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL parameter is required' });
+  }
+
+  try {
+    const domain = new URL(url).hostname;
+
+    const scanResponse = await axios.post(`${TLS_OBSERVATORY_MOZILLA_API}/scan`, null, {
+      params: { target: domain }
+    });
+
+    const { scan_id: scanId } = scanResponse.data;
+
+    if (typeof scanId !== 'number') {
+      throw new Error('Failed to get scan_id from TLS Observatory');
+    }
+
+    const resultResponse = await axios.get(`${TLS_OBSERVATORY_MOZILLA_API}/results`, {
+      params: { id: scanId }
+    });
+
+    res.json(resultResponse.data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ports
+router.get('/port-scan', async (req, res) => {
+  const PORTS = [
+    20, 21, 22, 23, 25, 53, 80, 67, 68, 69,
+    110, 119, 123, 143, 156, 161, 162, 179, 194,
+    389, 443, 587, 993, 995,
+    3000, 3306, 3389, 5060, 5900, 8000, 8080, 8888
+  ];
+
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL parameter is required' });
+  }
+
+  const domain = new URL(url).hostname;
+
+  const openPorts = [];
+  const failedPorts = [];
+
+  const checkPort = (port, domain) => {
+    return new Promise((resolve, reject) => {
+      const socket = new net.Socket();
+
+      socket.setTimeout(1500);
+
+      socket.on('connect', () => {
+        socket.destroy();
+        resolve(port);
+      });
+
+      socket.on('timeout', () => {
+        socket.destroy();
+        reject(new Error(`Timeout at port: ${port}`));
+      });
+
+      socket.on('error', (e) => {
+        socket.destroy();
+        reject(e);
+      });
+
+      socket.connect(port, domain);
+    });
+  };
+
+  const scanPorts = async () => {
+    const promises = PORTS.map(port => checkPort(port, domain)
+      .then(() => openPorts.push(port))
+      .catch(() => failedPorts.push(port))
+    );
+
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Function timed out')), 9000)
+    );
+
+    try {
+      await Promise.race([Promise.all(promises), timeoutPromise]);
+    } catch (error) {
+      if (error.message === 'Function timed out') {
+        const scannedPorts = [...openPorts, ...failedPorts];
+        const unscannedPorts = PORTS.filter(port => !scannedPorts.includes(port));
+        failedPorts.push(...unscannedPorts);
+      }
+    }
+  };
+
+  await scanPorts();
+
+  res.json({ openPorts, failedPorts });
+});
+
+// firewall
+router.get('/firewall', async (req, res) => {
+
+  const hasWaf = (waf) => {
+    return {
+      hasWaf: true, 
+      waf,
+    };
+  };  
+
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL parameter is required' });
+  }
+
+  const fullUrl = url.startsWith('http') ? url : `http://${url}`;
+
+  try {
+    const response = await axios.get(fullUrl);
+    const headers = response.headers;
+
+    if (headers['server'] && headers['server'].includes('cloudflare')) {
+      return res.json(hasWaf('Cloudflare'));
+    }
+
+    if (headers['x-powered-by'] && headers['x-powered-by'].includes('AWS Lambda')) {
+      return res.json(hasWaf('AWS WAF'));
+    }
+
+    if (headers['server'] && headers['server'].includes('AkamaiGHost')) {
+      return res.json(hasWaf('Akamai'));
+    }
+
+    if (headers['server'] && headers['server'].includes('Sucuri')) {
+      return res.json(hasWaf('Sucuri'));
+    }
+
+    if (headers['server'] && headers['server'].includes('BarracudaWAF')) {
+      return res.json(hasWaf('Barracuda WAF'));
+    }
+
+    if (headers['server'] && (headers['server'].includes('F5 BIG-IP') || headers['server'].includes('BIG-IP'))) {
+      return res.json(hasWaf('F5 BIG-IP'));
+    }
+
+    if (headers['x-sucuri-id'] || headers['x-sucuri-cache']) {
+      return res.json(hasWaf('Sucuri CloudProxy WAF'));
+    }
+
+    if (headers['server'] && headers['server'].includes('FortiWeb')) {
+      return res.json(hasWaf('Fortinet FortiWeb WAF'));
+    }
+
+    if (headers['server'] && headers['server'].includes('Imperva')) {
+      return res.json(hasWaf('Imperva SecureSphere WAF'));
+    }
+
+    if (headers['x-protected-by'] && headers['x-protected-by'].includes('Sqreen')) {
+      return res.json(hasWaf('Sqreen'));
+    }
+
+    if (headers['x-waf-event-info']) {
+      return res.json(hasWaf('Reblaze WAF'));
+    }
+
+    if (headers['set-cookie'] && headers['set-cookie'].includes('_citrix_ns_id')) {
+      return res.json(hasWaf('Citrix NetScaler'));
+    }
+
+    if (headers['x-denied-reason'] || headers['x-wzws-requested-method']) {
+      return res.json(hasWaf('WangZhanBao WAF'));
+    }
+
+    if (headers['x-webcoment']) {
+      return res.json(hasWaf('Webcoment Firewall'));
+    }
+
+    if (headers['server'] && headers['server'].includes('Yundun')) {
+      return res.json(hasWaf('Yundun WAF'));
+    }
+
+    if (headers['x-yd-waf-info'] || headers['x-yd-info']) {
+      return res.json(hasWaf('Yundun WAF'));
+    }
+
+    if (headers['server'] && headers['server'].includes('Safe3WAF')) {
+      return res.json(hasWaf('Safe3 Web Application Firewall'));
+    }
+
+    if (headers['server'] && headers['server'].includes('NAXSI')) {
+      return res.json(hasWaf('NAXSI WAF'));
+    }
+
+    if (headers['x-datapower-transactionid']) {
+      return res.json(hasWaf('IBM WebSphere DataPower'));
+    }
+
+    return res.json({ hasWaf: false });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// trace-route
+router.get('/traceroute', async (req, res) => {
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL parameter is required' });
+  }
+
+  try {
+    // Parse the URL and get the hostname
+    const urlObject = new URL(url);
+    const host = urlObject.hostname;
+
+    if (!host) {
+      throw new Error('Invalid URL provided');
+    }
+
+    // Perform traceroute with a promise
+    const result = await new Promise((resolve, reject) => {
+      traceroute.trace(host, (err, hops) => {
+        if (err || !hops) {
+          reject(err || new Error('No hops found'));
+        } else {
+          resolve(hops);
+        }
+      });
+    });
+
+    res.json({
+      message: "Traceroute completed!",
+      result,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // threats
 router.get('/threats',async (req,res)=>{})
