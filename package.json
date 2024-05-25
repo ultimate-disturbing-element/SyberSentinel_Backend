@@ -20,6 +20,7 @@
     "axios": "^1.6.8",
     "cheerio": "^1.0.0-rc.12",
     "connect-history-api-fallback": "^2.0.0",
+    "const": "^1.0.0",
     "cors": "^2.8.5",
     "dns": "^0.2.2",
     "dotenv": "^16.4.5",
@@ -28,11 +29,14 @@
     "fs": "0.0.1-security",
     "got": "^14.3.0",
     "net": "^1.0.2",
+    "node-fetch": "^3.3.2",
     "path": "^0.12.7",
     "psl": "^1.9.0",
     "puppeteer": "^22.10.0",
     "tls": "0.0.1",
     "traceroute": "^1.0.0",
-    "util": "^0.12.5"
+    "url-parse": "^1.5.10",
+    "util": "^0.12.5",
+    "xml2js": "^0.6.2"
   }
 }

@@ -10,6 +10,11 @@ const puppeteer = require('puppeteer');
 const https = require('https');
 const urlLib = require('url');
 const traceroute = require('traceroute');
+const URL = require('url-parse');
+const xml2js = require('xml2js');
+
+
+const dnsPromises = dns.promises;
 
 const router = express.Router();
 
@@ -741,7 +746,535 @@ router.get('/traceroute', async (req, res) => {
   }
 });
 
-// threats
-router.get('/threats',async (req,res)=>{})
+// dnssec
+router.get('/dnssec', async (req, res) => {
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({ error: 'url parameter is required' });
+  }
+
+  const dnsTypes = ['DNSKEY', 'DS', 'RRSIG'];
+  const records = {};
+
+  const fetchDNSRecord = (url, type) => {
+    return new Promise((resolve, reject) => {
+      const options = {
+        hostname: 'dns.google',
+        path: `/resolve?name=${encodeURIComponent(url)}&type=${type}`,
+        method: 'GET',
+        headers: {
+          'Accept': 'application/dns-json'
+        }
+      };
+
+      const req = https.request(options, res => {
+        let data = '';
+
+        res.on('data', chunk => {
+          data += chunk;
+        });
+
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch (error) {
+            reject(new Error('Invalid JSON response'));
+          }
+        });
+
+        res.on('error', error => {
+          reject(error);
+        });
+      });
+
+      req.end();
+    });
+  };
+
+  try {
+    for (const type of dnsTypes) {
+      const dnsResponse = await fetchDNSRecord(url, type);
+      
+      if (dnsResponse.Answer) {
+        records[type] = { isFound: true, answer: dnsResponse.Answer, response: dnsResponse.Answer };
+      } else {
+        records[type] = { isFound: false, answer: null, response: dnsResponse };
+      }
+    }
+
+    res.json(records);
+  } catch (error) {
+    res.status(500).json({ error: `Error fetching DNS records: ${error.message}` });
+  }
+});
+
+// mail-config
+router.get('/email-dns', async (req, res) => {
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL parameter is required' });
+  }
+
+  const domain = new URL(url).hostname || new URL(url).pathname;
+
+  try {
+
+    // Get MX records
+    const mxRecords = await dnsPromises.resolveMx(domain);
+
+    // Get TXT records
+    const txtRecords = await dnsPromises.resolveTxt(domain);
+
+    // Regular expressions for email-related TXT records
+    const emailTxtRegex = /^(v=spf1|v=DKIM1|v=DMARC1|protonmail-verification=|google-site-verification=|MS=|zoho-verification=|titan-verification=|bluehost.com)/;
+
+    // Filter for only email related TXT records
+    const emailTxtRecords = txtRecords.filter(record => {
+      return record.some(txt => emailTxtRegex.test(txt));
+    });
+
+    // Object to map specific TXT records to their corresponding email providers
+    const emailProviders = {
+      'protonmail-verification=': 'ProtonMail',
+      'google-site-verification=': 'Google Workspace',
+      'MS=': 'Microsoft 365',
+      'zoho-verification=': 'Zoho',
+      'titan-verification=': 'Titan',
+      'bluehost.com': 'BlueHost'
+    };
+
+    // Identify specific mail services
+    const mailServices = emailTxtRecords.map(record => {
+      const recordString = record.join('');
+      const provider = Object.entries(emailProviders).find(([txt, _]) => recordString.startsWith(txt));
+      return provider ? { provider: provider[1], value: recordString.split('=')[1] } : null;
+    }).filter(record => record !== null);
+
+    // Check MX records for Yahoo or Mimecast
+    const yahooOrMimecastMx = mxRecords.filter(record => record.exchange.includes('yahoodns.net') || record.exchange.includes('mimecast.com'));
+    const yahooMx = yahooOrMimecastMx.find(record => record.exchange.includes('yahoodns.net'));
+    const mimecastMx = yahooOrMimecastMx.find(record => record.exchange.includes('mimecast.com'));
+    if (yahooMx) {
+      mailServices.push({ provider: 'Yahoo', value: yahooMx.exchange });
+    }
+    if (mimecastMx) {
+      mailServices.push({ provider: 'Mimecast', value: mimecastMx.exchange });
+    }
+
+    res.json({
+      mxRecords,
+      txtRecords: emailTxtRecords,
+      mailServices,
+    });
+  } catch (error) {
+    if (error.code === 'ENOTFOUND' || error.code === 'ENODATA') {
+      res.status(200).json({ skipped: 'No mail server in use on this domain' });
+    } else {
+      res.status(500).json({ error: error.message });
+    }
+  }
+});
+
+// dns-server
+router.get('/dns-resolution', async (req, res) => {
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL parameter is required' });
+  }
+
+  try {
+    const domain = url.replace(/^(?:https?:\/\/)?/i, "");
+    const addresses = await dnsPromises.resolve4(domain);
+    const results = await Promise.all(addresses.map(async (address) => {
+      const hostname = await dnsPromises.reverse(address).catch(() => null);
+      let dohDirectSupports = false;
+      try {
+        await axios.get(`https://${address}/dns-query`);
+        dohDirectSupports = true;
+      } catch (error) {
+        dohDirectSupports = false;
+      }
+      return {
+        address,
+        hostname,
+        dohDirectSupports,
+      };
+    }));
+    res.json({
+      domain,
+      dns: results,
+      // dohMozillaSupport,
+    });
+  } catch (error) {
+    res.status(500).json({ error: `An error occurred while resolving DNS. ${error.message}` });
+  }
+});
+
+router.get('/security-txt', async (req, res) => {
+  const { url } = req.query;
+
+  const SECURITY_TXT_PATHS = [
+    '/security.txt',
+    '/.well-known/security.txt',
+  ];
+
+  const parseResult = (result) => {
+    const output = {};
+    const counts = {};
+    const lines = result.split('\n');
+    const regex = /^([^:]+):\s*(.+)$/;
+
+    for (const line of lines) {
+      if (!line.startsWith('#') && !line.startsWith('-----') && line.trim() !== '') {
+        const match = line.match(regex);
+        if (match && match.length > 2) {
+          let key = match[1].trim();
+          const value = match[2].trim();
+          counts[key] = counts[key] ? counts[key] + 1 : 1;
+          key += counts[key];
+          output[key] = value;
+        }
+      }
+    }
+
+    return output;
+  };
+
+  const isPgpSigned = (result) => {
+    return result.includes('-----BEGIN PGP SIGNED MESSAGE-----');
+  };
+
+  async function fetchSecurityTxt(url) {
+    return new Promise((resolve, reject) => {
+      https.get(url.toString(), (res) => {
+        if (res.statusCode === 200) {
+          let data = '';
+          res.on('data', (chunk) => {
+            data += chunk;
+          });
+          res.on('end', () => {
+            resolve(data);
+          });
+        } else {
+          resolve(null);
+        }
+      }).on('error', (err) => {
+        reject(err);
+      });
+    });
+  }
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL parameter is required' });
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url.includes('://') ? url : 'https://' + url);
+  } catch (error) {
+    return res.status(400).json({ error: 'Invalid URL format' });
+  }
+  parsedUrl.pathname = '';
+
+  let result;
+  for (const path of SECURITY_TXT_PATHS) {
+    try {
+      const securityTxtUrl = new URL(path, parsedUrl);
+      const response = await fetchSecurityTxt(securityTxtUrl);
+
+      if (response && response.includes('<html')) {
+        result = { isPresent: false };
+        break;
+      }
+
+      if (response) {
+        result = {
+          isPresent: true,
+          foundIn: path,
+          content: response,
+          isPgpSigned: isPgpSigned(response),
+          fields: parseResult(response),
+        };
+        break;
+      }
+    } catch (error) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  res.json(result || { isPresent: false });
+});
+
+// robots-txt
+router.get('/robots-txt', async (req, res) => {
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL parameter is required' });
+  }
+
+  try {
+    const parsedData = async (content) => {
+      const lines = content.split('\n');
+      const rules = [];
+
+      lines.forEach(line => {
+        line = line.trim();  
+
+        let match = line.match(/^(Allow|Disallow):\s*(\S*)$/i);
+        if (match) {
+          rules.push({ lbl: match[1], val: match[2] });
+        } else {
+          match = line.match(/^(User-agent):\s*(\S*)$/i);
+          if (match) {
+            rules.push({ lbl: match[1], val: match[2] });
+          }
+        }
+      });
+
+      return { robots: rules };
+    };
+
+    const parsedURL = new URL(url);
+    const robotsURL = `${parsedURL.protocol}//${parsedURL.hostname}/robots.txt`;
+
+    const response = await axios.get(robotsURL);
+    if (response.status === 200) {
+      const result = await parsedData(response.data);
+      if (!result.robots || result.robots.length === 0) {
+        return res.json({ skipped: 'No robots.txt file present, unable to continue' });
+      }
+      return res.json(result);
+    } else {
+      return res.status(response.status).json({ error: 'Failed to fetch robots.txt', statusCode: response.status });
+    }
+  } catch (error) {
+    return res.status(500).json({ error: `Error fetching robots.txt: ${error.message}` });
+  }
+});
+
+// sitemaps
+router.get('/sitemap', async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: 'URL parameter is required' });
+
+  try {
+    const sitemapUrl = `${url}/sitemap.xml`;
+    const hardTimeOut = 5000;
+
+    let sitemapRes;
+    try {
+      sitemapRes = await axios.get(sitemapUrl, { timeout: hardTimeOut });
+    } catch (error) {
+      if (error.response && error.response.status === 404) {
+        const robotsRes = await axios.get(`${url}/robots.txt`, { timeout: hardTimeOut });
+        const sitemapUrlFromRobots = robotsRes.data.split('\n')
+          .find(line => line.toLowerCase().startsWith('sitemap:'));
+        if (!sitemapUrlFromRobots) throw new Error('No sitemap found in robots.txt');
+        sitemapRes = await axios.get(sitemapUrlFromRobots.split(' ')[1].trim(), { timeout: hardTimeOut });
+      } else {
+        throw error;
+      }
+    }
+
+    const parser = new xml2js.Parser();
+    const sitemap = await parser.parseStringPromise(sitemapRes.data);
+    res.json(sitemap);
+  } catch (error) {
+    const message = error.code === 'ECONNABORTED' ? `Request timed-out after ${hardTimeOut}ms` : error.message;
+    res.status(500).json({ error: message });
+  }
+});
+
+// txt-records
+router.get('/dns-txt', async (req, res) => {
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL parameter is required' });
+  }
+
+  try {
+    const parsedUrl = new URL(url);
+    
+    const txtRecords = await dnsPromises.resolveTxt(parsedUrl.hostname);
+
+    // Parsing and formatting TXT records into a single object
+    const readableTxtRecords = txtRecords.reduce((acc, recordArray) => {
+      const recordObject = recordArray.reduce((recordAcc, recordString) => {
+        const [key, ...value] = recordString.split('=');
+        return { ...recordAcc, [key]: value.join('=') };
+      }, {});
+      return { ...acc, ...recordObject };
+    }, {});
+
+    res.json(readableTxtRecords);
+  } catch (error) {
+    if (error.code === 'ERR_INVALID_URL') {
+      return res.status(400).json({ error: `Invalid URL ${error}` });
+    } else {
+      res.status(500).json({ error: error.message });
+    }
+  }
+});
+
+// generic Ip Location
+const getLocation = (response) => {
+  return {
+    city: response.city,
+    region: response.region,
+    country: response.country_name,
+    postCode: response.postal,
+    regionCode: response.region_code,
+    countryCode: response.country_code,
+    coords: {
+      latitude: response.latitude,
+      longitude: response.longitude,
+    },
+    isp: response.org,
+    timezone: response.timezone,
+    languages: response.languages,
+    currencyCode: response.currency,
+    currency: response.currency_name,
+    countryDomain: response.country_tld,
+    countryAreaSize: response.country_area,
+    countryPopulation: response.country_population,
+  };
+};
+
+router.get('/ip-location', async (req, res) => {
+  const { ipAddress } = req.query;
+
+  if (!ipAddress) {
+    return res.status(400).json({ error: 'IP Address parameter is required' });
+  }
+
+  try {
+    const response = await fetch(`https://ipapi.co/${ipAddress}/json/`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch IP location data for ${ipAddress}`);
+    }
+    const locationData = await response.json();
+    const locationInfo = getLocation(locationData);
+    res.json(locationInfo);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// servers Status
+router.get('/server-status', async (req, res) => {
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL parameter is required' });
+  }
+
+  try {
+    const startTime = Date.now();
+
+    const { dnsLookupTime, responseCode } = await new Promise((resolve, reject) => {
+      const req = https.get(url, res => {
+        res.on('data', () => {});
+        res.on('end', () => {
+          resolve({
+            dnsLookupTime: Date.now() - startTime,
+            responseCode: res.statusCode
+          });
+        });
+      });
+
+      req.on('error', err => reject(err));
+      req.end();
+    });
+
+    if (responseCode < 200 || responseCode >= 400) {
+      throw new Error(`Received non-success response code: ${responseCode}`);
+    }
+
+    const responseTime = Date.now() - startTime;
+    return res.json({ isUp: true, dnsLookupTime, responseTime, responseCode });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// carbon
+router.get('/website-carbon', async (req, res) => {
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL parameter is required' });
+  }
+
+  try {
+    // Get the size of the website's HTML
+    const response = await fetch(url);
+    const sizeInBytes = Buffer.byteLength(await response.text(), 'utf8');
+
+    // Use the size to get the carbon data
+    const apiUrl = `https://api.websitecarbon.com/data?bytes=${sizeInBytes}&green=0`;
+    const carbonResponse = await fetch(apiUrl);
+    const carbonData = await carbonResponse.json();
+
+    if (!carbonData.statistics || (carbonData.statistics.adjustedBytes === 0 && carbonData.statistics.energy === 0)) {
+      return res.json({ skipped: 'Not enough info to get carbon data' });
+    }
+
+    carbonData.scanUrl = url;
+    return res.json(carbonData);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// archieves
+router.get('/archieves', async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: 'URL parameter is required' });
+
+  const convertTimestampToDate = (timestamp) => new Date(timestamp.slice(0, 4), timestamp.slice(4, 6) - 1, timestamp.slice(6, 8), timestamp.slice(8, 10), timestamp.slice(10, 12), timestamp.slice(12, 14));
+
+  const countPageChanges = (results) => results.reduce((acc, curr) => (curr[2] !== acc.prevDigest ? { prevDigest: curr[2], count: acc.count + 1 } : acc), { prevDigest: null, count: -1 }).count;
+
+  const getAveragePageSize = (scans) => Math.round(scans.reduce((sum, scan) => sum + parseInt(scan[3], 10), 0) / scans.length);
+
+  const getScanFrequency = (firstScan, lastScan, totalScans, changeCount) => {
+    const dayFactor = (lastScan - firstScan) / (1000 * 60 * 60 * 24);  
+    const format = (num) => parseFloat(num.toFixed(2));
+    return { 
+      daysBetweenScans: format(dayFactor / totalScans),
+      daysBetweenChanges: format(dayFactor / changeCount),
+      scansPerDay: format((totalScans - 1) / dayFactor),
+      changesPerDay: format(changeCount / dayFactor)
+    };
+  };
+
+  const getWaybackData = async (url) => {
+    const cdxUrl = `https://web.archive.org/cdx/search/cdx?url=${url}&output=json&fl=timestamp,statuscode,digest,length,offset`;
+    try {
+      const { data } = await axios.get(cdxUrl);
+      if (!data || !Array.isArray(data) || data.length <= 1) return { skipped: 'Site has never before been archived via the Wayback Machine' };
+      data.shift();
+      const firstScan = convertTimestampToDate(data[0][0]);
+      const lastScan = convertTimestampToDate(data[data.length - 1][0]);
+      const totalScans = data.length;
+      const changeCount = countPageChanges(data);
+      return { firstScan, lastScan, totalScans, changeCount, averagePageSize: getAveragePageSize(data), scanFrequency: getScanFrequency(firstScan, lastScan, totalScans, changeCount), scans: data, scanUrl: url };
+    } catch (err) {
+      return { error: `Error fetching Wayback data: ${err.message}` };
+    }
+  };
+
+  try {
+    const waybackData = await getWaybackData(url);
+    res.json(waybackData);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 module.exports = router;
