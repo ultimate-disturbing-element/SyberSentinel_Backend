@@ -26,6 +26,7 @@
     "express": "^4.19.2",
     "express-rate-limit": "^7.2.0",
     "fs": "0.0.1-security",
+    "got": "^14.3.0",
     "net": "^1.0.2",
     "path": "^0.12.7",
     "psl": "^1.9.0",
